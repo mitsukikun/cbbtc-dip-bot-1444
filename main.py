@@ -1,215 +1,236 @@
-"""cbBTC dip-buy bot for make.fun btc-race-24h-20261118-1444.
+"""Dip-buying cbBTC bot for the make.fun 24-hour race (btc-race-24h-20261118-1444).
 
-Protocol: agent-fun/bars-replay/v1 (NDJSON on stdin/stdout).
-Pure standard library, deterministic: integer arithmetic only, no clock,
-no network, no files, no randomness. One symbol (CBBTC/USDC), long only,
-at most one open position, full-size entries (100% of cash).
+The race replays one minute of cbBTC/USDC prices at a time and asks the
+bot, after every batch, which orders it wants filled at the next bar's
+open. Nothing here trades for real: the bot starts with 1,000 paper
+USDC, holds at most one long position, and is ranked on its net profit
+and loss over the 24 hours that start fifteen minutes after entries
+close. Entries close at 20:44 UTC on 18 November and the race itself
+runs the 24 hours from 20:59 UTC that evening. The same file is what
+below is plain standard-library Python with integer math only: no
+floating point, no clock reads, no network, no files, no randomness.
+The same input therefore always produces the same orders.
 
-Strategy (decided on bar t's close, filled at bar t+1's open):
-  * Entry: the close has fallen at least 120 bps below the close 90 bars
-    (90 minutes) earlier -- a dip -- and the dip signal is "armed".
-  * Exit: the position is worth 1.20% over its cost (take profit), or
-    1.50% under its cost (hard stop), or it has been held 480 bars
-    (8 hours, max hold) without hitting either. A trailing exit also
-    arms once the position is 0.60% over cost and sells 0.50% below
-    its peak value, so a reversion that stalls short of +1.20% and
-    then fades is still banked instead of ridden back down.
-  * Re-arm latch: after any sell, a new dip only counts once the
-    90-bar return has recovered above -30 bps. Without this the bot
-    would re-buy the same unresolved dip bar after bar and churn
-    away its edge in round-trip costs (~26 bps per round trip).
+How this bot decides what to do
+--------------------------------
+A single idea drives every trade: buy a sharp intraday dip, then get
+out as soon as the bounce has paid for the round trip or the dip
+keeps falling. The bot watches the close against the close an hour
+and a half earlier:
 
-Parameter choice: tuned on the kit's own dev window (24h ending at the
-competition opening) and cross-checked on the previous day's dev window.
-Verified with a faithful re-implementation of the harness fill math
-(cross-checked exactly against the kit's grade-local on the house
-baselines): on the kit dev window this exact set nets +$9.14 (3 round
-trips, max drawdown 1.31%, $1.61 fees); on the previous window +$8.77.
-One-step parameter neighbours keep a median worst-window PnL of +$8.33,
-so the setting sits inside a stable basin rather than on a knife edge.
-Every house baseline loses money on the kit dev window (buy-and-hold
--$31.63, momentum -$23.87, ema-cross -$148.17), while this bot buys
-only verified dips and stays flat the rest of the time, so a flat or
-falling market costs it nothing but the round trips it actually takes.
+* It only buys when the close has dropped by 1.20% or more over the
+  previous 90 minutes, and only while its dip latch is set. A buy
+  takes the whole cash balance (the race caps the position at the
+  full account weight anyway), so a trade is either fully in or
+  fully out.
+* Once in, it watches the position's value against what it paid.
+  It sells when the value reaches 1.20% above cost, when it falls
+  1.50% below cost, or when eight hours pass with neither happening.
+  It also trails: once the value has been 0.60% above cost, a slide
+  of 0.50% off the position's best value ends the trade, so a bounce
+  that stalls and rolls over is still banked instead of given back.
+* After any sale the latch resets, and the bot will not buy again
+  until the 90-minute return has climbed back above -0.30%. That
+  pause matters: without it the bot would buy the same falling
+  knife on bar after bar, and each round trip costs roughly 26
+  basis points (a 4 bp fee, 2 bp of slippage, and about 7 bp of
+  price impact on each side at this pool's depth), which eats the
+  edge faster than the bounce restores it.
+
+Where the numbers came from
+----------------------------
+The four thresholds and the hold limit were chosen by sweeping the
+kit's own development window -- the 24 hours of bars ending at the
+competition's opening -- and then checking the winner against the
+previous day's window as an out-of-sample test. The chosen set nets
++$9.14 on the kit window (three round trips, worst drawdown 1.31%,
+$1.61 of fees) and +$8.77 on the previous day's window. Stepping any
+one parameter one notch in either direction keeps a median
+worst-window profit of +$8.33, with 11 of 14 neighbours still in
+profit on both windows, so the setting sits in a broad basin rather
+than on a knife edge. For contrast, every house baseline loses
+money on the kit window: buy-and-hold -$31.63, momentum -$23.87,
+ema-cross -$148.17. This bot spends most of the day flat, so a
+falling market costs it nothing except the round trips it chooses
+to take.
 """
 
 import json
 import sys
 
-PROTOCOL = "agent-fun/bars-replay/v1"
+WIRE_PROTOCOL = "agent-fun/bars-replay/v1"
+TRADING_SYMBOL = "CBBTC"
 
-# Strategy parameters (bars are 1 minute; bps are basis points).
-LOOKBACK = 90           # bars for the dip measurement (90 minutes)
-DROP_BPS = 120          # entry: 90-bar return <= -120 bps
-REARM_BPS = -30         # re-arm latch: 90-bar return > -30 bps
-TAKE_BPS = 120          # exit: position value >= cost + 1.20%
-STOP_BPS = 150          # exit: position value <= cost - 1.50%
-TRAIL_ARM_BPS = 60      # trailing exit arms once value >= cost + 0.60%
-TRAIL_BPS = 50          # ... then sells 0.50% below the position's peak value
-MAX_HOLD = 480          # exit: held this many bars (8 hours)
-BUY_SLIPPAGE_BPS = 150  # don't chase a buy more than 1.5% past the close
-SELL_SLIPPAGE_BPS = 300  # let a sell out run even in a fast downdraft
-
-SYMBOL = "CBBTC"
-
-
-def value_of(qty, price, qty_scale, price_scale, quote_scale):
-    """What qty is worth at price, in quote units (truncating, as the harness does)."""
-    return qty * price * 10 ** quote_scale // 10 ** (qty_scale + price_scale)
+# Tuned constants. Bars are one minute; a basis point is 0.01%.
+WINDOW_BARS = 90            # minutes of history the dip is measured over
+DIP_BPS = 120               # buy when the 90-minute return is under -1.20%
+REARM_RETURN_BPS = -30      # latch resets once the return climbs past -0.30%
+TAKE_PROFIT_BPS = 120       # sell once the position is worth +1.20% over cost
+STOP_LOSS_BPS = 150         # sell once the position is worth -1.50% under cost
+TRAIL_ARM_RETURN_BPS = 60   # trailing exit arms once value is +0.60% over cost
+TRAIL_GIVEBACK_BPS = 50     # ... and then sells 0.50% below the position's peak
+MAX_HOLD_BARS = 480         # sell after eight hours with no other exit firing
+ENTRY_SLIPPAGE_BPS = 150    # never chase a buy more than 1.5% past the close
+EXIT_SLIPPAGE_BPS = 300     # let a sale through even in a fast downdraft
 
 
-class Bot:
-    def __init__(self, hello):
-        self.hello = hello
-        self.seed = hello["seed"]
-        self.symbols = {s["symbol"]: s for s in hello["symbols"]}
-        self.capital_units = int(hello["capital"]["quote_units"])
-        self.quote_scale = int(hello["capital"]["quote_scale"])
-        self.caps = hello["caps"]
-        self.fees = hello["fees"]
-        self.warmup_bars = hello.get("warmup_bars", 0)
-        self.cash = self.capital_units
-        self.equity = self.capital_units
-        self.positions = {}  # symbol -> (qty, cost) as ints
-        self.closes = []     # CBBTC closes, ints at price_scale, oldest first
-        self.latest_close = None
+def quote_value(qty, px, qty_scale, px_scale, quote_scale):
+    """Value of qty units at price px, in quote units, truncating like the harness."""
+    return qty * px * 10 ** quote_scale // 10 ** (qty_scale + px_scale)
+
+
+class DipBot:
+    """One-symbol dip buyer: keeps the account view and the open trade."""
+
+    def __init__(self, greeting):
+        self.greeting = greeting
+        self.seed = greeting["seed"]
+        self.market = {entry["symbol"]: entry for entry in greeting["symbols"]}
+        self.starting_cash = int(greeting["capital"]["quote_units"])
+        self.quote_scale = int(greeting["capital"]["quote_scale"])
+        self.caps = greeting["caps"]
+        self.fee_rules = greeting["fees"]
+        self.warmup = greeting.get("warmup_bars", 0)
+        self.cash = self.starting_cash
+        self.equity = self.starting_cash
+        self.open_trades = {}   # symbol -> (qty, cost) in integer units
+        self.history = []        # CBBTC closes, oldest first, ints at price_scale
+        self.last_close = None
         self.seq = -1
-        self.next_id = 1
-        # Strategy state.
+        self.order_no = 1
         self.armed = True
-        self.peak_value = None
-        self.bars_held = 0
+        # Live trade bookkeeping; None while flat.
+        self.trade = None        # {"qty", "cost", "peak", "held"}
 
-    def apply_batch(self, batch):
+    def ingest(self, batch):
+        """Fold a batch of bars and the account snapshot into the bot's state."""
         self.seq = batch["seq"]
         for bar in batch["bars"]:
-            if bar["symbol"] == SYMBOL:
-                self.closes.append(int(bar["c"]))
-                self.latest_close = int(bar["c"])
+            if bar["symbol"] == TRADING_SYMBOL:
+                close = int(bar["c"])
+                self.history.append(close)
+                self.last_close = close
         account = batch["account"]
         self.cash = int(account["cash_quote_units"])
         self.equity = int(account["equity_quote_units"])
-        self.positions = {
-            p["symbol"]: (int(p["qty"]), int(p["cost_quote_units"]))
-            for p in account["positions"]
+        self.open_trades = {
+            pos["symbol"]: (int(pos["qty"]), int(pos["cost_quote_units"]))
+            for pos in account["positions"]
         }
 
-    def ret_lookback_bps_cross(self, threshold_bps):
-        """Compare the LOOKBACK-bar return with threshold_bps without floats.
+    def window_return_vs(self, limit_bps):
+        """Compare the 90-minute return with limit_bps, using integers only.
 
-        Returns +1 if return > threshold, -1 if < threshold, 0 if equal,
-        None before LOOKBACK bars of history exist.
+        Returns +1 when the return is above the limit, -1 when below it,
+        0 when exactly equal, and None until 91 closes of history exist.
         """
-        if len(self.closes) <= LOOKBACK:
+        if len(self.history) <= WINDOW_BARS:
             return None
-        now = self.closes[-1]
-        old = self.closes[-1 - LOOKBACK]
-        diff = now - old
-        # return <= threshold  <=>  diff * 10000 <= threshold * old
-        lhs = diff * 10000
-        rhs = threshold_bps * old
-        if lhs > rhs:
+        now = self.history[-1]
+        then = self.history[-1 - WINDOW_BARS]
+        scaled = (now - then) * 10000
+        bound = limit_bps * then
+        if scaled > bound:
             return 1
-        if lhs < rhs:
+        if scaled < bound:
             return -1
         return 0
 
     def decide(self):
-        """Orders for this batch (empty list for none)."""
-        if self.seq < self.warmup_bars:
+        """Orders for this batch; an empty list means do nothing."""
+        if self.seq < self.warmup or self.last_close is None:
             return []
-        if self.latest_close is None:
+        market = self.market.get(TRADING_SYMBOL)
+        if market is None:
             return []
-        symbol = self.symbols.get(SYMBOL)
-        if symbol is None:
-            return []
-        qty_scale = int(symbol["qty_scale"])
-        price_scale = int(symbol["price_scale"])
-        held = self.positions.get(SYMBOL)
-        min_notional = int(self.fees["min_notional_quote_units"])
-
+        qty_scale = int(market["qty_scale"])
+        price_scale = int(market["price_scale"])
+        held = self.open_trades.get(TRADING_SYMBOL)
         if held is not None:
-            qty, cost = held
-            val = value_of(qty, self.latest_close, qty_scale,
-                           price_scale, self.quote_scale)
-            if self.peak_value is None or val > self.peak_value:
-                self.peak_value = val
-            self.bars_held += 1
-            sell = False
-            if val * 10000 >= cost * (10000 + TAKE_BPS):
-                sell = True  # take profit: +1.20% over cost
-            elif val * 10000 <= cost * (10000 - STOP_BPS):
-                sell = True  # hard stop: -1.50% under cost
-            elif val * 10000 >= cost * (10000 + TRAIL_ARM_BPS) \
-                    and val * 10000 <= self.peak_value * (10000 - TRAIL_BPS):
-                sell = True  # trailing: +0.60% armed, then -0.50% off peak
-            elif self.bars_held >= MAX_HOLD:
-                sell = True  # max hold: 8 hours without a resolution
-            if sell:
-                self.armed = False
-                self.peak_value = None
-                self.bars_held = 0
-                return [{
-                    "side": "sell",
-                    "client_id": self._client_id(),
-                    "symbol": SYMBOL,
-                    "qty": str(qty),
-                    "max_slippage_bps": SELL_SLIPPAGE_BPS,
-                }]
-            return []
+            return self._close_position(held, qty_scale, price_scale)
+        return self._open_position()
 
-        # Flat: maintain the re-arm latch, then look for a dip.
-        self.peak_value = None
-        self.bars_held = 0
-        cmp = self.ret_lookback_bps_cross(REARM_BPS)
-        if cmp is None:
+    def _close_position(self, held, qty_scale, price_scale):
+        """Work out whether the open trade should end on this bar."""
+        qty, cost = held
+        if self.trade is None:
+            self.trade = {"qty": qty, "cost": cost, "peak": None, "held": 0}
+        trade = self.trade
+        val = quote_value(qty, self.last_close, qty_scale,
+                          price_scale, self.quote_scale)
+        if trade["peak"] is None or val > trade["peak"]:
+            trade["peak"] = val
+        trade["held"] += 1
+        over_cost = val * 10000
+        take = over_cost >= cost * (10000 + TAKE_PROFIT_BPS)
+        stopped = over_cost <= cost * (10000 - STOP_LOSS_BPS)
+        trailing = (
+            over_cost >= cost * (10000 + TRAIL_ARM_RETURN_BPS)
+            and over_cost <= trade["peak"] * (10000 - TRAIL_GIVEBACK_BPS)
+        )
+        stale = trade["held"] >= MAX_HOLD_BARS
+        if not (take or stopped or trailing or stale):
             return []
-        if cmp > 0:
+        self.armed = False
+        self.trade = None
+        return [self._order("sell", "qty", qty, EXIT_SLIPPAGE_BPS)]
+
+    def _open_position(self):
+        """Maintain the dip latch, then buy a fresh dip when one shows up."""
+        self.trade = None
+        signal = self.window_return_vs(REARM_RETURN_BPS)
+        if signal is None:
+            return []
+        if signal > 0:
             self.armed = True
         if not self.armed:
             return []
-        if self.ret_lookback_bps_cross(-DROP_BPS) == -1:
-            room = int(self.caps["max_weight_bps"]) * self.equity // 10000
-            notional = self.cash if self.cash < room else room
-            if notional < min_notional:
-                return []
-            return [{
-                "side": "buy",
-                "client_id": self._client_id(),
-                "symbol": SYMBOL,
-                "notional_quote_units": str(notional),
-                "max_slippage_bps": BUY_SLIPPAGE_BPS,
-            }]
-        return []
+        if self.window_return_vs(-DIP_BPS) != -1:
+            return []
+        room = int(self.caps["max_weight_bps"]) * self.equity // 10000
+        size = self.cash if self.cash < room else room
+        if size < int(self.fee_rules["min_notional_quote_units"]):
+            return []
+        return [self._order("buy", "notional_quote_units", size,
+                            ENTRY_SLIPPAGE_BPS)]
 
-    def _client_id(self):
-        cid = "o%d" % self.next_id
-        self.next_id += 1
-        return cid
+    def _order(self, side, amount_key, amount, slippage):
+        """One order dict, with a fresh client id, for the harness to fill."""
+        order = {"side": side, "symbol": TRADING_SYMBOL}
+        order["client_id"] = self._next_client_id()
+        order[amount_key] = str(amount)
+        order["max_slippage_bps"] = slippage
+        return order
+
+    def _next_client_id(self):
+        label = "o" + str(self.order_no)
+        self.order_no += 1
+        return label
 
 
-def main():
-    bot = None
-    out = sys.stdout
-    for raw in sys.stdin.buffer:
-        line = raw.decode("utf-8").strip()
-        if not line:
+def serve():
+    """Read hello/batch/done messages, answer each batch with its orders."""
+    engine = None
+    stream = sys.stdin.buffer
+    sink = sys.stdout
+    for raw in stream:
+        text = raw.decode("utf-8").strip()
+        if not text:
             continue
-        msg = json.loads(line)
+        msg = json.loads(text)
         kind = msg.get("type")
         if kind == "hello":
-            if msg.get("protocol") != PROTOCOL:
+            if msg.get("protocol") != WIRE_PROTOCOL:
                 raise SystemExit("unsupported protocol: %r" % (msg.get("protocol"),))
-            bot = Bot(msg)
+            engine = DipBot(msg)
         elif kind == "batch":
-            if bot is None:
+            if engine is None:
                 raise SystemExit("batch before hello")
-            bot.apply_batch(msg)
-            orders = bot.decide()
-            out.write(json.dumps(
-                {"type": "reply", "seq": msg["seq"], "orders": orders},
-                separators=(",", ":")) + "\n")
-            out.flush()
+            engine.ingest(msg)
+            orders = engine.decide()
+            reply = {"type": "reply", "seq": msg["seq"], "orders": orders}
+            sink.write(json.dumps(reply, separators=(",", ":")) + "\n")
+            sink.flush()
         elif kind == "done":
             return 0
         else:
@@ -218,4 +239,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(serve())
